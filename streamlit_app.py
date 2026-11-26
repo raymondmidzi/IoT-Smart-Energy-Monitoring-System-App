@@ -31,7 +31,6 @@ st.markdown(
         color: #FFFFFF !important;
         font-weight: 600;
     }
-    /* Ensure alert/error boxes keep dark readable text */
     [data-testid="stAlert"] * {
         color: #111111 !important;
     }
@@ -199,7 +198,7 @@ def lock_keys(keys, duration=3.0):
     shared_state["locks"][k] = expiry
 
 
-def on_connect(client, userdata, flags, rc):
+def on_connect(client, userdata, flags, rc, properties=None):
   if rc == 0:
     client.subscribe(TOPIC_TELEMETRY)
 
@@ -221,11 +220,22 @@ def on_message(client, userdata, msg):
 @st.cache_resource
 def init_mqtt():
   unique_id = f"SEMS-Web-{uuid.uuid4().hex[:8]}"
-  client = mqtt.Client(client_id=unique_id)
+  # Support both paho-mqtt 1.x and 2.x seamlessly
+  if hasattr(mqtt, "CallbackAPIVersion"):
+    client = mqtt.Client(
+        callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
+        client_id=unique_id,
+    )
+  else:
+    client = mqtt.Client(client_id=unique_id)
+
   client.on_connect = on_connect
   client.on_message = on_message
   client.reconnect_delay_set(min_delay=1, max_delay=10)
-  client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+  try:
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+  except Exception:
+    client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
   client.loop_start()
   return client
 
@@ -265,7 +275,6 @@ with st.sidebar:
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
-  # Ensure MQTT reconnects automatically if broker dropped idle connection
   if not mqtt_client.is_connected():
     try:
       mqtt_client.reconnect()
@@ -275,10 +284,9 @@ def render_active_page(active_page):
   data = shared_state["telemetry"]
   manual_active = data.get("manual", 0) == 1
 
-  # Determine real-time ESP32 online status (15s window handles mobile/cloud jitter cleanly)
+  # Check if telemetry packets arrived within the last 15 seconds
   last_seen = shared_state.get("last_seen", 0.0)
-  seconds_since_seen = time.time() - last_seen
-  is_online = (last_seen > 0) and (seconds_since_seen <= 15.0)
+  is_online = (last_seen > 0) and ((time.time() - last_seen) <= 15.0)
 
   if is_online:
     status_html = '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
@@ -374,11 +382,12 @@ def render_active_page(active_page):
         )
 
       with r1_c2:
+        days_display = min(int(round(float(data.get("days", 24)))), 999)
         st.markdown(
             f"""
             <div class="dwin-subcard">
                 <div class="card-label">📅 Days</div>
-                <div class="card-value-red">{int(data.get('days', 24))}</div>
+                <div class="card-value-red">{days_display}</div>
                 <div class="card-note">Estimate Remaining</div>
             </div>
             """,
