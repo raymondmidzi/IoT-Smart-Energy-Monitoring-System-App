@@ -36,9 +36,14 @@ st.markdown(
         padding: 15px 25px;
         border-radius: 10px;
         margin-bottom: 20px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 10px;
     }
     .hmi-title {
-        font-size: 28px;
+        font-size: 26px;
         font-weight: 800;
         color: #FFFFFF;
         margin: 0;
@@ -48,6 +53,26 @@ st.markdown(
         font-size: 14px;
         color: #cce4ff;
         margin-top: 4px;
+    }
+    .status-badge-online {
+        background: rgba(20, 140, 75, 0.85);
+        border: 1.5px solid #52ffa8;
+        color: #ffffff;
+        padding: 6px 14px;
+        border-radius: 20px;
+        font-weight: 700;
+        font-size: 13px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+    }
+    .status-badge-offline {
+        background: rgba(165, 42, 42, 0.85);
+        border: 1.5px solid #ff8585;
+        color: #ffffff;
+        padding: 6px 14px;
+        border-radius: 20px;
+        font-weight: 700;
+        font-size: 13px;
+        box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
     }
     .dwin-panel {
         background: rgba(20, 65, 125, 0.65);
@@ -117,7 +142,7 @@ st.markdown(
 )
 
 # ============================================================
-# MQTT CLOUD CONNECTION (Passive Listener + User-Triggered Only)
+# MQTT CLOUD CONNECTION & SECURITY PIN
 # ============================================================
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
@@ -125,6 +150,9 @@ TOPIC_TELEMETRY = "sems/ray/telemetry"
 TOPIC_CONTROL = "sems/ray/control"
 TOPIC_TOPUP = "sems/ray/topup"
 TOPIC_SETTINGS = "sems/ray/settings"
+
+ADMIN_PIN = "1234"
+LIVE_APP_URL = "https://iot-smart-energy-monitoring-system-app-ll9eogusavugx8scs5x6qj.streamlit.app/"
 
 
 @st.cache_resource
@@ -152,6 +180,7 @@ def get_shared_state():
           "manual": 0,
       },
       "locks": {},
+      "last_seen": 0.0,
   }
 
 
@@ -168,6 +197,7 @@ def on_message(client, userdata, msg):
   try:
     payload = json.loads(msg.payload.decode())
     now = time.time()
+    shared_state["last_seen"] = now
     for k, v in payload.items():
       if shared_state["locks"].get(k, 0) > now:
         continue
@@ -187,6 +217,9 @@ def init_mqtt():
 
 
 mqtt_client = init_mqtt()
+
+if "settings_unlocked" not in st.session_state:
+  st.session_state["settings_unlocked"] = False
 
 # ============================================================
 # LEFT SIDEBAR MENU
@@ -212,27 +245,37 @@ with st.sidebar:
   st.markdown("---")
   auto_refresh = st.checkbox("Live Sync (2s)", value=True)
 
-# ============================================================
-# TOP PERSISTENT BANNER
-# ============================================================
-st.markdown(
-    """
-<div class="hmi-header">
-    <div class="hmi-title">IoT SMART ENERGY MANAGEMENT SYSTEM</div>
-    <div class="hmi-subtitle">Real-time Monitoring | Load Management | Usage Trends</div>
-</div>
-""",
-    unsafe_allow_html=True,
-)
-
 
 # ============================================================
-# LIVE CONTENT FRAGMENT (Prevents full-page ghosting & flicker)
+# LIVE CONTENT FRAGMENT (Header Badge + Active Page)
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
   data = shared_state["telemetry"]
   manual_active = data.get("manual", 0) == 1
+
+  # Determine real-time ESP32 online status (active if packet received within last 8 seconds)
+  seconds_since_seen = time.time() - shared_state.get("last_seen", 0.0)
+  is_online = shared_state.get("last_seen", 0.0) > 0 and seconds_since_seen < 8.0
+
+  status_html = (
+      '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
+      if is_online
+      else '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
+  )
+
+  st.markdown(
+      f"""
+      <div class="hmi-header">
+          <div>
+              <div class="hmi-title">IoT SMART ENERGY MANAGEMENT SYSTEM</div>
+              <div class="hmi-subtitle">Real-time Monitoring | Load Management | Usage Trends</div>
+          </div>
+          <div>{status_html}</div>
+      </div>
+      """,
+      unsafe_allow_html=True,
+  )
 
   # ----------------------------------------------------------
   # PAGE 1: HOME
@@ -556,66 +599,96 @@ def render_active_page(active_page):
     st.markdown("</div>", unsafe_allow_html=True)
 
   # ----------------------------------------------------------
-  # PAGE 5: SETTINGS
+  # PAGE 5: SETTINGS (PIN-PROTECTED)
   # ----------------------------------------------------------
   elif active_page == "⚙️ Settings":
     st.markdown('<div class="dwin-panel">', unsafe_allow_html=True)
 
-    s1_lbl, s1_ctrl = st.columns([2, 1])
-    with s1_lbl:
-      st.markdown("### Manual Control")
+    if not st.session_state["settings_unlocked"]:
+      st.markdown("### 🔐 Admin Authentication Required")
       st.caption(
-          "ON = Manual switching enabled | OFF = Automatic tiered load shedding"
-          " active (manual switching locked)"
+          "Enter the 4-digit meter PIN to access Manual Control override and"
+          " Prepaid Token Top-up."
       )
-    with s1_ctrl:
-      manual_key = f"manual_sw_{int(manual_active)}"
+      pin_col, btn_col = st.columns([2, 1])
+      with pin_col:
+        entered_pin = st.text_input(
+            "Admin PIN",
+            type="password",
+            max_chars=6,
+            placeholder="Default PIN: 1234",
+            key="pin_input_box",
+            label_visibility="collapsed",
+        )
+      with btn_col:
+        if st.button("🔓 Unlock Settings", key="btn_unlock_pin", use_container_width=True):
+          if entered_pin == ADMIN_PIN:
+            st.session_state["settings_unlocked"] = True
+            st.rerun()
+          else:
+            st.error("❌ Incorrect PIN. Please try again.")
+    else:
+      top_s_col, lock_s_col = st.columns([3, 1])
+      with lock_s_col:
+        if st.button("🔒 Lock Settings", key="btn_lock_settings", use_container_width=True):
+          st.session_state["settings_unlocked"] = False
+          st.rerun()
 
-      def make_manual_cb(k, prev_m):
-        def _cb():
-          new_m = st.session_state.get(k, not prev_m)
-          lock_keys(["manual"], 3.0)
-          shared_state["telemetry"]["manual"] = 1 if new_m else 0
-          mqtt_client.publish(TOPIC_SETTINGS, f"manual:{1 if new_m else 0}")
+      s1_lbl, s1_ctrl = st.columns([2, 1])
+      with s1_lbl:
+        st.markdown("### Manual Control")
+        st.caption(
+            "ON = Manual switching enabled | OFF = Automatic tiered load shedding"
+            " active (manual switching locked)"
+        )
+      with s1_ctrl:
+        manual_key = f"manual_sw_{int(manual_active)}"
 
-        return _cb
+        def make_manual_cb(k, prev_m):
+          def _cb():
+            new_m = st.session_state.get(k, not prev_m)
+            lock_keys(["manual"], 3.0)
+            shared_state["telemetry"]["manual"] = 1 if new_m else 0
+            mqtt_client.publish(TOPIC_SETTINGS, f"manual:{1 if new_m else 0}")
 
-      st.toggle(
-          "Manual Control",
-          value=manual_active,
-          key=manual_key,
-          on_change=make_manual_cb(manual_key, manual_active),
-          label_visibility="collapsed",
+          return _cb
+
+        st.toggle(
+            "Manual Control",
+            value=manual_active,
+            key=manual_key,
+            on_change=make_manual_cb(manual_key, manual_active),
+            label_visibility="collapsed",
+        )
+
+      st.markdown(
+          "<hr style='border-color: rgba(255,255,255,0.35);'>",
+          unsafe_allow_html=True,
       )
 
-    st.markdown(
-        "<hr style='border-color: rgba(255,255,255,0.35);'>",
-        unsafe_allow_html=True,
-    )
-
-    s2_lbl, s2_ctrl = st.columns([2, 1])
-    with s2_lbl:
-      st.markdown("### Top-up Units")
-      st.caption("Enter prepaid token units (kWh) to credit the meter")
-    with s2_ctrl:
-      topup_units = st.number_input(
-          "Units",
-          min_value=1.0,
-          max_value=5000.0,
-          value=10.0,
-          key="topup_num_input",
-          label_visibility="collapsed",
-      )
-      if st.button(
-          "⌨️ Credit Units", key="btn_credit_units", use_container_width=True
-      ):
-        mqtt_client.publish(TOPIC_TOPUP, str(topup_units))
-        st.success(f"Credited {topup_units:.2f} units!")
+      s2_lbl, s2_ctrl = st.columns([2, 1])
+      with s2_lbl:
+        st.markdown("### Top-up Units")
+        st.caption("Enter prepaid token units (kWh) to credit the meter")
+      with s2_ctrl:
+        topup_units = st.number_input(
+            "Units",
+            min_value=1.0,
+            max_value=5000.0,
+            value=10.0,
+            key="topup_num_input",
+            label_visibility="collapsed",
+        )
+        if st.button(
+            "⌨️ Credit Units", key="btn_credit_units", use_container_width=True
+        ):
+          mqtt_client.publish(TOPIC_TOPUP, str(topup_units))
+          st.success(f"Credited {topup_units:.2f} units!")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
   # ----------------------------------------------------------
-  # PAGE 6: ABOUT
+  # PAGE 6: ABOUT (WITH MOBILE ACCESS QR CODE)
   # ----------------------------------------------------------
   elif active_page == "ℹ️ About":
     st.markdown('<div class="dwin-panel">', unsafe_allow_html=True)
@@ -624,18 +697,34 @@ def render_active_page(active_page):
         unsafe_allow_html=True,
     )
     st.write("")
-    st.markdown(
-        """
-      <p style='font-size: 18px; line-height: 1.6;'>
-      The IoT Smart Energy Management System has been designed by <b>Raymond Midzi</b> as a final-year research project in partial fulfilment of the requirements for the Bachelor of Engineering (Hons) Degree in Mechatronics with Chinhoyi University of Technology, Zimbabwe.
-      </p>
-      <br>
-      <p style='font-size: 18px; line-height: 1.6;'>
-      <b>PROJECT FOCUS:</b> Real-Time Monitoring | Energy Analytics | Predictive Management | Intelligent Load Control
-      </p>
-      """,
-        unsafe_allow_html=True,
-    )
+
+    about_col, qr_col = st.columns([2.2, 1])
+    with about_col:
+      st.markdown(
+          """
+        <p style='font-size: 18px; line-height: 1.6;'>
+        The IoT Smart Energy Management System has been designed by <b>Raymond Midzi</b> as a final-year research project in partial fulfilment of the requirements for the Bachelor of Engineering (Hons) Degree in Mechatronics with Chinhoyi University of Technology, Zimbabwe.
+        </p>
+        <br>
+        <p style='font-size: 18px; line-height: 1.6;'>
+        <b>PROJECT FOCUS:</b> Real-Time Monitoring | Energy Analytics | Predictive Management | Intelligent Load Control
+        </p>
+        """,
+          unsafe_allow_html=True,
+      )
+    with qr_col:
+      qr_api = f"https://api.qrserver.com/v1/create-qr-code/?size=180x180&data={LIVE_APP_URL}"
+      st.markdown(
+          f"""
+          <div class="dwin-subcard" style="text-align: center;">
+              <div class="card-label">📱 Mobile Cloud Access</div>
+              <img src="{qr_api}" alt="Dashboard QR Code" style="border-radius: 10px; border: 4px solid #ffffff; margin: 8px 0;" />
+              <div class="card-note">Scan to open live dashboard on mobile</div>
+          </div>
+          """,
+          unsafe_allow_html=True,
+      )
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 
