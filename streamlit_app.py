@@ -1,5 +1,6 @@
 import json
 import time
+import uuid
 import paho.mqtt.client as mqtt
 import pandas as pd
 import plotly.express as px
@@ -12,7 +13,7 @@ st.set_page_config(
     page_title="IoT Smart Energy Management System",
     page_icon="🏠",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown(
@@ -30,6 +31,10 @@ st.markdown(
         color: #FFFFFF !important;
         font-weight: 600;
     }
+    /* Ensure alert/error boxes keep dark readable text */
+    [data-testid="stAlert"] * {
+        color: #111111 !important;
+    }
     .hmi-header {
         background: rgba(16, 52, 102, 0.75);
         border-bottom: 3px solid #66b2ff;
@@ -43,19 +48,19 @@ st.markdown(
         gap: 10px;
     }
     .hmi-title {
-        font-size: 26px;
+        font-size: 24px;
         font-weight: 800;
         color: #FFFFFF;
         margin: 0;
         letter-spacing: 0.5px;
     }
     .hmi-subtitle {
-        font-size: 14px;
+        font-size: 13px;
         color: #cce4ff;
         margin-top: 4px;
     }
     .status-badge-online {
-        background: rgba(20, 140, 75, 0.85);
+        background: rgba(20, 140, 75, 0.9);
         border: 1.5px solid #52ffa8;
         color: #ffffff;
         padding: 6px 14px;
@@ -65,7 +70,7 @@ st.markdown(
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
     }
     .status-badge-offline {
-        background: rgba(165, 42, 42, 0.85);
+        background: rgba(165, 42, 42, 0.9);
         border: 1.5px solid #ff8585;
         color: #ffffff;
         padding: 6px 14px;
@@ -181,6 +186,7 @@ def get_shared_state():
       },
       "locks": {},
       "last_seen": 0.0,
+      "packet_count": 0,
   }
 
 
@@ -193,11 +199,17 @@ def lock_keys(keys, duration=3.0):
     shared_state["locks"][k] = expiry
 
 
+def on_connect(client, userdata, flags, rc):
+  if rc == 0:
+    client.subscribe(TOPIC_TELEMETRY)
+
+
 def on_message(client, userdata, msg):
   try:
     payload = json.loads(msg.payload.decode())
     now = time.time()
     shared_state["last_seen"] = now
+    shared_state["packet_count"] += 1
     for k, v in payload.items():
       if shared_state["locks"].get(k, 0) > now:
         continue
@@ -208,10 +220,12 @@ def on_message(client, userdata, msg):
 
 @st.cache_resource
 def init_mqtt():
-  client = mqtt.Client()
+  unique_id = f"SEMS-Web-{uuid.uuid4().hex[:8]}"
+  client = mqtt.Client(client_id=unique_id)
+  client.on_connect = on_connect
   client.on_message = on_message
-  client.connect(MQTT_BROKER, MQTT_PORT, 60)
-  client.subscribe(TOPIC_TELEMETRY)
+  client.reconnect_delay_set(min_delay=1, max_delay=10)
+  client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
   client.loop_start()
   return client
 
@@ -251,18 +265,25 @@ with st.sidebar:
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
+  # Ensure MQTT reconnects automatically if broker dropped idle connection
+  if not mqtt_client.is_connected():
+    try:
+      mqtt_client.reconnect()
+    except Exception:
+      pass
+
   data = shared_state["telemetry"]
   manual_active = data.get("manual", 0) == 1
 
-  # Determine real-time ESP32 online status (active if packet received within last 8 seconds)
-  seconds_since_seen = time.time() - shared_state.get("last_seen", 0.0)
-  is_online = shared_state.get("last_seen", 0.0) > 0 and seconds_since_seen < 8.0
+  # Determine real-time ESP32 online status (15s window handles mobile/cloud jitter cleanly)
+  last_seen = shared_state.get("last_seen", 0.0)
+  seconds_since_seen = time.time() - last_seen
+  is_online = (last_seen > 0) and (seconds_since_seen <= 15.0)
 
-  status_html = (
-      '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
-      if is_online
-      else '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
-  )
+  if is_online:
+    status_html = '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
+  else:
+    status_html = '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
 
   st.markdown(
       f"""
@@ -550,10 +571,10 @@ def render_active_page(active_page):
 
     if not manual_active:
       st.warning(
-          "🔒 **Manual Control is OFF (Automatic Mode Active):** Individual load"
+          "🔒 Manual Control is OFF (Automatic Mode Active): Individual load"
           " switches are locked while tiered auto-shedding manages loads (Air"
           " Con < 100 | Water Heater < 80 | Lighting < 40 | Fridge < 20). Turn"
-          " **Manual Control ON** in Settings or Home to switch loads manually."
+          " Manual Control ON in Settings or Home to switch loads manually."
       )
 
     loads = [
