@@ -618,6 +618,11 @@ def render_active_page(active_page):
           x="Time",
           y="Power (kW)",
           title="Live Daily Load Curve (Measured kW)",
+          color_discrete_sequence=["#ff4b4b"],
+      )
+      fig.update_traces(
+          line=dict(color="#ff4b4b", width=2.5),
+          fillcolor="rgba(255, 75, 75, 0.35)",
       )
       fig.update_yaxes(rangemode="tozero")
     elif period == "Week":
@@ -642,7 +647,9 @@ def render_active_page(active_page):
           x="Day",
           y="Energy (kWh)",
           title="Weekly Measured Consumption (kWh)",
+          color_discrete_sequence=["#ff4b4b"],
       )
+      fig.update_traces(marker_line_color="#ff8585", marker_line_width=1.5)
       fig.update_yaxes(rangemode="tozero")
     else:
       daily_map = shared_state.get("daily_kwh", {})
@@ -660,6 +667,11 @@ def render_active_page(active_page):
           y="Energy (kWh)",
           markers=True,
           title="Monthly Measured Trend (kWh)",
+          color_discrete_sequence=["#ff4b4b"],
+      )
+      fig.update_traces(
+          line=dict(color="#ff4b4b", width=3),
+          marker=dict(color="#ff4b4b", size=9),
       )
       fig.update_yaxes(rangemode="tozero")
 
