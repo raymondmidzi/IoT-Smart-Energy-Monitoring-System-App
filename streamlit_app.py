@@ -59,7 +59,7 @@ st.markdown(
         margin-top: 4px;
     }
     .status-badge-online {
-        background: rgba(20, 140, 75, 0.9);
+        background: rgba(20, 140, 75, 0.95);
         border: 1.5px solid #52ffa8;
         color: #ffffff;
         padding: 6px 14px;
@@ -69,7 +69,7 @@ st.markdown(
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
     }
     .status-badge-offline {
-        background: rgba(165, 42, 42, 0.9);
+        background: rgba(165, 42, 42, 0.95);
         border: 1.5px solid #ff8585;
         color: #ffffff;
         padding: 6px 14px;
@@ -187,13 +187,14 @@ def get_shared_state():
       "locks": {},
       "last_seen": 0.0,
       "packet_count": 0,
+      "mqtt_connected": False,
   }
 
 
 shared_state = get_shared_state()
 
 
-def lock_keys(keys, duration=3.0):
+def lock_keys(keys, duration=2.5):
   expiry = time.time() + duration
   for k in keys:
     shared_state["locks"][k] = expiry
@@ -201,7 +202,12 @@ def lock_keys(keys, duration=3.0):
 
 def on_connect(client, userdata, flags, rc, properties=None):
   if rc == 0:
+    shared_state["mqtt_connected"] = True
     client.subscribe(TOPIC_TELEMETRY)
+
+
+def on_disconnect(client, userdata, rc, properties=None):
+  shared_state["mqtt_connected"] = False
 
 
 def on_message(client, userdata, msg):
@@ -221,7 +227,6 @@ def on_message(client, userdata, msg):
 @st.cache_resource
 def init_mqtt():
   unique_id = f"SEMS-Web-{uuid.uuid4().hex[:8]}"
-  # Support both paho-mqtt 1.x and 2.x seamlessly
   if hasattr(mqtt, "CallbackAPIVersion"):
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
@@ -231,12 +236,10 @@ def init_mqtt():
     client = mqtt.Client(client_id=unique_id)
 
   client.on_connect = on_connect
+  client.on_disconnect = on_disconnect
   client.on_message = on_message
-  client.reconnect_delay_set(min_delay=1, max_delay=10)
-  try:
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-  except Exception:
-    client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+  client.reconnect_delay_set(min_delay=1, max_delay=5)
+  client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
   client.loop_start()
   return client
 
@@ -276,18 +279,16 @@ with st.sidebar:
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
-  if not mqtt_client.is_connected():
-    try:
-      mqtt_client.reconnect()
-    except Exception:
-      pass
+  # Ensure active subscription & loop health
+  if shared_state.get("mqtt_connected", False):
+    mqtt_client.subscribe(TOPIC_TELEMETRY)
 
   data = shared_state["telemetry"]
-  manual_active = data.get("manual", 0) == 1
+  manual_active = int(data.get("manual", 0)) == 1
 
-  # Check if telemetry packets arrived within the last 15 seconds
+  # Check if telemetry packets arrived within the last 10 seconds
   last_seen = shared_state.get("last_seen", 0.0)
-  is_online = (last_seen > 0) and ((time.time() - last_seen) <= 15.0)
+  is_online = (last_seen > 0.0) and ((time.time() - last_seen) <= 10.0)
 
   if is_online:
     status_html = '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
@@ -324,7 +325,7 @@ def render_active_page(active_page):
           use_container_width=True,
       ):
         devices = ["sec", "ref", "lit", "wh", "ac"]
-        lock_keys(devices, 3.0)
+        lock_keys(devices, 2.5)
         for dev in devices:
           shared_state["telemetry"][dev] = 1
           mqtt_client.publish(TOPIC_CONTROL, f"{dev}:1")
@@ -339,7 +340,7 @@ def render_active_page(active_page):
           use_container_width=True,
       ):
         devices = ["sec", "ref", "lit", "wh", "ac"]
-        lock_keys(devices, 3.0)
+        lock_keys(devices, 2.5)
         for dev in devices:
           shared_state["telemetry"][dev] = 0
           mqtt_client.publish(TOPIC_CONTROL, f"{dev}:0")
@@ -354,7 +355,7 @@ def render_active_page(active_page):
       )
       if st.button(btn_label, key="btn_home_manual", use_container_width=True):
         new_manual = 0 if manual_active else 1
-        lock_keys(["manual"], 3.0)
+        lock_keys(["manual"], 2.5)
         shared_state["telemetry"]["manual"] = new_manual
         mqtt_client.publish(TOPIC_SETTINGS, f"manual:{new_manual}")
 
@@ -600,13 +601,13 @@ def render_active_page(active_page):
       with c_lbl:
         st.markdown(f"#### {label}")
       with c_sw:
-        current_val = data.get(key, 0) == 1
+        current_val = int(data.get(key, 0)) == 1
         widget_key = f"sw_{key}_{int(current_val)}_{int(manual_active)}"
 
         def make_on_change(dev_key, prev_val):
           def _cb():
             new_state = not prev_val
-            lock_keys([dev_key], 3.0)
+            lock_keys([dev_key], 2.5)
             shared_state["telemetry"][dev_key] = 1 if new_state else 0
             mqtt_client.publish(
                 TOPIC_CONTROL, f"{dev_key}:{1 if new_state else 0}"
@@ -638,8 +639,8 @@ def render_active_page(active_page):
     if not st.session_state["settings_unlocked"]:
       st.markdown("### 🔐 Admin Authentication Required")
       st.caption(
-          "Enter the 4-digit meter PIN to access Manual Control override and"
-          " Prepaid Token Top-up."
+          "Enter the meter PIN to access Manual Control override and Prepaid"
+          " Token Top-up."
       )
       pin_col, btn_col = st.columns([2, 1])
       with pin_col:
@@ -675,10 +676,10 @@ def render_active_page(active_page):
       with s1_ctrl:
         manual_key = f"manual_sw_{int(manual_active)}"
 
-        def make_manual_cb(k, prev_m):
+        def make_manual_cb(prev_m):
           def _cb():
-            new_m = st.session_state.get(k, not prev_m)
-            lock_keys(["manual"], 3.0)
+            new_m = not prev_m
+            lock_keys(["manual"], 2.5)
             shared_state["telemetry"]["manual"] = 1 if new_m else 0
             mqtt_client.publish(TOPIC_SETTINGS, f"manual:{1 if new_m else 0}")
 
@@ -688,7 +689,7 @@ def render_active_page(active_page):
             "Manual Control",
             value=manual_active,
             key=manual_key,
-            on_change=make_manual_cb(manual_key, manual_active),
+            on_change=make_manual_cb(manual_active),
             label_visibility="collapsed",
         )
 
