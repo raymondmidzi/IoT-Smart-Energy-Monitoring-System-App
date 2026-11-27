@@ -168,6 +168,7 @@ st.markdown(
 # ============================================================
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_PORT = 1883
+MQTT_WS_PORT = 8000
 TOPIC_TELEMETRY = "sems/ray/telemetry"
 TOPIC_CONTROL = "sems/ray/control"
 TOPIC_TOPUP = "sems/ray/topup"
@@ -226,11 +227,11 @@ def get_shared_state():
           "voltage": 0.00,
           "current": 0.00,
           "power": 0.00,
-          "frequency": 50.0,
+          "frequency": 0.00,
           "pf": 0.00,
           "apparent": 0.00,
           "reactive": 0.00,
-          "phase": 5.807,
+          "phase": 0.000,
           "kwh": 0.00,
           "units": 100.00,
           "days": 24,
@@ -253,6 +254,7 @@ def get_shared_state():
       "last_seen": 0.0,
       "packet_count": 0,
       "mqtt_connected": False,
+      "mqtt_status_msg": "Connecting to HiveMQ...",
       "last_reconnect_attempt": 0.0,
   }
 
@@ -269,11 +271,16 @@ def lock_keys(keys, duration=2.5):
 def on_connect(client, userdata, flags, rc, properties=None):
   if rc == 0:
     shared_state["mqtt_connected"] = True
+    shared_state["mqtt_status_msg"] = "Broker Connected"
     client.subscribe(TOPIC_TELEMETRY)
+  else:
+    shared_state["mqtt_connected"] = False
+    shared_state["mqtt_status_msg"] = f"Broker rc={rc}"
 
 
 def on_disconnect(client, userdata, rc, properties=None):
   shared_state["mqtt_connected"] = False
+  shared_state["mqtt_status_msg"] = "Broker Reconnecting..."
 
 
 def on_message(client, userdata, msg):
@@ -326,27 +333,43 @@ def on_message(client, userdata, msg):
     pass
 
 
-@st.cache_resource
-def init_mqtt():
+def _build_mqtt_client(transport="tcp", port=1883):
   unique_id = f"SEMS-Web-{uuid.uuid4().hex[:8]}"
   if hasattr(mqtt, "CallbackAPIVersion"):
-    client = mqtt.Client(
+    c = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
         client_id=unique_id,
+        transport=transport,
     )
   else:
-    client = mqtt.Client(client_id=unique_id)
+    c = mqtt.Client(client_id=unique_id, transport=transport)
+  if transport == "websockets":
+    c.ws_set_options(path="/mqtt")
+  c.on_connect = on_connect
+  c.on_disconnect = on_disconnect
+  c.on_message = on_message
+  c.reconnect_delay_set(min_delay=1, max_delay=5)
+  c.connect(MQTT_BROKER, port, 60)
+  c.loop_start()
+  return c
 
-  client.on_connect = on_connect
-  client.on_disconnect = on_disconnect
-  client.on_message = on_message
-  client.reconnect_delay_set(min_delay=1, max_delay=5)
+
+@st.cache_resource
+def init_mqtt():
   try:
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    return _build_mqtt_client("tcp", MQTT_PORT)
   except Exception:
-    client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
-  client.loop_start()
-  return client
+    try:
+      return _build_mqtt_client("websockets", MQTT_WS_PORT)
+    except Exception as e:
+      shared_state["mqtt_status_msg"] = f"Broker error: {e}"
+      c = mqtt.Client(client_id=f"SEMS-Web-{uuid.uuid4().hex[:8]}")
+      c.on_connect = on_connect
+      c.on_disconnect = on_disconnect
+      c.on_message = on_message
+      c.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+      c.loop_start()
+      return c
 
 
 mqtt_client = init_mqtt()
@@ -407,6 +430,7 @@ def render_active_page(active_page):
 
   last_seen = shared_state.get("last_seen", 0.0)
   is_online = (last_seen > 0.0) and ((time.time() - last_seen) <= 10.0)
+  broker_note = shared_state.get("mqtt_status_msg", "")
 
   if is_online:
     status_html = '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
@@ -416,14 +440,14 @@ def render_active_page(active_page):
     status_html = (
         '<div style="text-align: right;">'
         '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
-        f'<div class="last-seen-text">Last seen: {last_seen_str}</div>'
+        f'<div class="last-seen-text">Last seen: {last_seen_str} ({broker_note})</div>'
         '</div>'
     )
   else:
     status_html = (
         '<div style="text-align: right;">'
         '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
-        '<div class="last-seen-text">Last seen: Never (awaiting telemetry)</div>'
+        f'<div class="last-seen-text">Last seen: Never ({broker_note})</div>'
         '</div>'
     )
 
