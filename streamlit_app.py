@@ -281,7 +281,10 @@ def init_mqtt():
   client.on_disconnect = on_disconnect
   client.on_message = on_message
   client.reconnect_delay_set(min_delay=1, max_delay=5)
-  client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+  try:
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+  except Exception:
+    client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
   client.loop_start()
   return client
 
@@ -321,8 +324,13 @@ with st.sidebar:
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
-  # Ensure active subscription & loop health
-  if shared_state.get("mqtt_connected", False):
+  # Ensure active subscription & self-healing broker connection
+  if not shared_state.get("mqtt_connected", False):
+    try:
+      mqtt_client.reconnect()
+    except Exception:
+      pass
+  else:
     mqtt_client.subscribe(TOPIC_TELEMETRY)
 
   data = shared_state["telemetry"]
