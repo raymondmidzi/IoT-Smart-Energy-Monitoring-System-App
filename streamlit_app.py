@@ -155,13 +155,14 @@ TOPIC_CONTROL = "sems/ray/control"
 TOPIC_TOPUP = "sems/ray/topup"
 TOPIC_SETTINGS = "sems/ray/settings"
 
-ADMIN_PIN = "1234"
+DEFAULT_ADMIN_PIN = "1234"
 LIVE_APP_URL = "https://iot-smart-energy-monitoring-system-app-ll9eogusavugx8scs5x6qj.streamlit.app/"
 
 
 @st.cache_resource
 def get_shared_state():
   return {
+      "admin_pin": DEFAULT_ADMIN_PIN,
       "telemetry": {
           "voltage": 0.00,
           "current": 0.00,
@@ -645,14 +646,14 @@ def render_active_page(active_page):
         entered_pin = st.text_input(
             "Admin PIN",
             type="password",
-            max_chars=6,
-            placeholder="Default PIN: 1234",
+            max_chars=8,
+            placeholder="Enter Admin PIN",
             key="pin_input_box",
             label_visibility="collapsed",
         )
       with btn_col:
         if st.button("🔓 Unlock Settings", key="btn_unlock_pin", use_container_width=True):
-          if entered_pin == ADMIN_PIN:
+          if entered_pin == shared_state["admin_pin"]:
             st.session_state["settings_unlocked"] = True
             st.rerun()
           else:
@@ -714,6 +715,51 @@ def render_active_page(active_page):
         ):
           mqtt_client.publish(TOPIC_TOPUP, str(topup_units))
           st.success(f"Credited {topup_units:.2f} units!")
+
+      st.markdown(
+          "<hr style='border-color: rgba(255,255,255,0.35);'>",
+          unsafe_allow_html=True,
+      )
+
+      s3_lbl, s3_ctrl = st.columns([2, 1])
+      with s3_lbl:
+        st.markdown("### 🔑 Change Admin PIN")
+        st.caption("Update the 4–8 digit security PIN required to unlock Settings")
+      with s3_ctrl:
+        curr_pin_in = st.text_input(
+            "Current PIN",
+            type="password",
+            max_chars=8,
+            placeholder="Current PIN",
+            key="curr_pin_input",
+            label_visibility="collapsed",
+        )
+        new_pin_in = st.text_input(
+            "New PIN",
+            type="password",
+            max_chars=8,
+            placeholder="New PIN (4–8 digits)",
+            key="new_pin_input",
+            label_visibility="collapsed",
+        )
+        confirm_pin_in = st.text_input(
+            "Confirm New PIN",
+            type="password",
+            max_chars=8,
+            placeholder="Confirm New PIN",
+            key="confirm_pin_input",
+            label_visibility="collapsed",
+        )
+        if st.button("💾 Update PIN", key="btn_update_pin", use_container_width=True):
+          if curr_pin_in != shared_state["admin_pin"]:
+            st.error("❌ Current PIN is incorrect.")
+          elif len(new_pin_in) < 4 or not new_pin_in.isdigit():
+            st.error("❌ New PIN must be 4 to 8 digits.")
+          elif new_pin_in != confirm_pin_in:
+            st.error("❌ New PIN and confirmation do not match.")
+          else:
+            shared_state["admin_pin"] = new_pin_in
+            st.success("✅ Admin PIN updated successfully!")
 
     st.markdown("</div>", unsafe_allow_html=True)
 
