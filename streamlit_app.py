@@ -534,7 +534,7 @@ def render_active_page(active_page):
           f"""
           <div class="dwin-subcard">
               <div class="card-label">〰️ Frequency</div>
-              <div class="card-value-cyan">{data.get('frequency', 50):.0f} Hz</div>
+              <div class="card-value-cyan">{float(data.get('frequency', 0.0)):.2f} Hz</div>
           </div>
           """,
           unsafe_allow_html=True,
