@@ -1,3 +1,4 @@
+import datetime
 import json
 import time
 import uuid
@@ -77,6 +78,14 @@ st.markdown(
         font-weight: 700;
         font-size: 13px;
         box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+        display: inline-block;
+    }
+    .last-seen-text {
+        font-size: 11.5px;
+        color: #ffd6d6;
+        margin-top: 5px;
+        text-align: right;
+        font-weight: 600;
     }
     .dwin-panel {
         background: rgba(20, 65, 125, 0.65);
@@ -157,6 +166,7 @@ TOPIC_SETTINGS = "sems/ray/settings"
 
 DEFAULT_ADMIN_PIN = "1234"
 LIVE_APP_URL = "https://iot-smart-energy-monitoring-system-app-ll9eogusavugx8scs5x6qj.streamlit.app/"
+CAT_TZ = datetime.timezone(datetime.timedelta(hours=2))
 
 
 @st.cache_resource
@@ -184,6 +194,9 @@ def get_shared_state():
           "ac": 0,
           "manual": 0,
       },
+      "history": [],
+      "daily_kwh": {},
+      "last_kwh": None,
       "locks": {},
       "last_seen": 0.0,
       "packet_count": 0,
@@ -220,6 +233,35 @@ def on_message(client, userdata, msg):
       if shared_state["locks"].get(k, 0) > now:
         continue
       shared_state["telemetry"][k] = v
+
+    # Record live timestamped sample (Harare CAT UTC+2) for real load curve
+    local_dt = datetime.datetime.fromtimestamp(now, tz=CAT_TZ)
+    kw_val = round(float(shared_state["telemetry"].get("power", 0.0)) / 1000.0, 3)
+    v_val = round(float(shared_state["telemetry"].get("voltage", 0.0)), 2)
+    i_val = round(float(shared_state["telemetry"].get("current", 0.0)), 2)
+    kwh_total = float(shared_state["telemetry"].get("kwh", 0.0))
+
+    hist = shared_state["history"]
+    hist.append({
+        "Time": local_dt.strftime("%H:%M:%S"),
+        "Power (kW)": kw_val,
+        "Voltage (V)": v_val,
+        "Current (A)": i_val,
+    })
+    if len(hist) > 720:  # Keep rolling ~24-minute window at 2s intervals
+      del hist[:-720]
+
+    # Track real daily accumulated kWh
+    day_key = local_dt.strftime("%Y-%m-%d")
+    prev_kwh = shared_state["last_kwh"]
+    if prev_kwh is not None and kwh_total >= prev_kwh:
+      delta_kwh = kwh_total - prev_kwh
+      shared_state["daily_kwh"][day_key] = (
+          shared_state["daily_kwh"].get(day_key, 0.0) + delta_kwh
+      )
+    elif day_key not in shared_state["daily_kwh"]:
+      shared_state["daily_kwh"][day_key] = round(kwh_total, 4)
+    shared_state["last_kwh"] = kwh_total
   except Exception:
     pass
 
@@ -292,8 +334,22 @@ def render_active_page(active_page):
 
   if is_online:
     status_html = '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
+  elif last_seen > 0.0:
+    last_seen_dt = datetime.datetime.fromtimestamp(last_seen, tz=CAT_TZ)
+    last_seen_str = last_seen_dt.strftime("%d %b %Y, %H:%M:%S CAT")
+    status_html = (
+        '<div style="text-align: right;">'
+        '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
+        f'<div class="last-seen-text">Last seen: {last_seen_str}</div>'
+        '</div>'
+    )
   else:
-    status_html = '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
+    status_html = (
+        '<div style="text-align: right;">'
+        '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
+        '<div class="last-seen-text">Last seen: Never (awaiting telemetry)</div>'
+        '</div>'
+    )
 
   st.markdown(
       f"""
@@ -521,7 +577,7 @@ def render_active_page(active_page):
     st.markdown("</div>", unsafe_allow_html=True)
 
   # ----------------------------------------------------------
-  # PAGE 3: CONSUMPTION
+  # PAGE 3: CONSUMPTION (REAL LIVE TELEMETRY HISTORY)
   # ----------------------------------------------------------
   elif active_page == "📊 Consumption":
     st.markdown('<div class="dwin-panel">', unsafe_allow_html=True)
@@ -538,31 +594,66 @@ def render_active_page(active_page):
           label_visibility="collapsed",
       )
 
+    hist = shared_state.get("history", [])
+    now_cat = datetime.datetime.now(tz=CAT_TZ)
+
     if period == "Day":
-      df = pd.DataFrame({
-          "Time": [f"{h:02d}:00" for h in range(24)],
-          "Power (kW)": [
-              (data["power"] / 1000.0) * (0.5 + 0.5 * (h % 5 / 5))
-              for h in range(24)
-          ],
-      })
-      fig = px.area(df, x="Time", y="Power (kW)", title="Daily Load Curve")
+      if hist:
+        df = pd.DataFrame(hist)
+      else:
+        df = pd.DataFrame({
+            "Time": [now_cat.strftime("%H:%M:%S")],
+            "Power (kW)": [round(data["power"] / 1000.0, 3)],
+        })
+      fig = px.area(
+          df,
+          x="Time",
+          y="Power (kW)",
+          title="Live Daily Load Curve (Measured kW)",
+      )
+      fig.update_yaxes(rangemode="tozero")
     elif period == "Week":
+      days_list = [now_cat - datetime.timedelta(days=i) for i in range(6, -1, -1)]
+      daily_map = shared_state.get("daily_kwh", {})
+      today_str = now_cat.strftime("%Y-%m-%d")
       df = pd.DataFrame({
-          "Day": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"],
+          "Day": [d.strftime("%a %d") for d in days_list],
           "Energy (kWh)": [
-              data["kwh"] * d for d in [0.12, 0.15, 0.14, 0.18, 0.16, 0.13, 0.12]
+              round(
+                  daily_map.get(
+                      d.strftime("%Y-%m-%d"),
+                      data["kwh"] if d.strftime("%Y-%m-%d") == today_str else 0.0,
+                  ),
+                  4,
+              )
+              for d in days_list
           ],
       })
-      fig = px.bar(df, x="Day", y="Energy (kWh)", title="Weekly Consumption")
+      fig = px.bar(
+          df,
+          x="Day",
+          y="Energy (kWh)",
+          title="Weekly Measured Consumption (kWh)",
+      )
+      fig.update_yaxes(rangemode="tozero")
     else:
+      daily_map = shared_state.get("daily_kwh", {})
+      total_measured = max(sum(daily_map.values()), float(data.get("kwh", 0.0)))
+      curr_week_idx = min((now_cat.day - 1) // 7, 3)
+      week_vals = [0.0, 0.0, 0.0, 0.0]
+      week_vals[curr_week_idx] = round(total_measured, 4)
       df = pd.DataFrame({
           "Week": ["Week 1", "Week 2", "Week 3", "Week 4"],
-          "Energy (kWh)": [data["kwh"] * w for w in [0.22, 0.25, 0.28, 0.25]],
+          "Energy (kWh)": week_vals,
       })
       fig = px.line(
-          df, x="Week", y="Energy (kWh)", markers=True, title="Monthly Trend"
+          df,
+          x="Week",
+          y="Energy (kWh)",
+          markers=True,
+          title="Monthly Measured Trend (kWh)",
       )
+      fig.update_yaxes(rangemode="tozero")
 
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
@@ -570,6 +661,9 @@ def render_active_page(active_page):
         font_color="#FFFFFF",
     )
     st.plotly_chart(fig, key=f"chart_{period}", use_container_width=True)
+    st.caption(
+        f"📡 Live telemetry samples recorded: {len(hist)} | Total metered energy: {data['kwh']:.3f} kWh"
+    )
     st.markdown("</div>", unsafe_allow_html=True)
 
   # ----------------------------------------------------------
