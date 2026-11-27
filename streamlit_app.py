@@ -253,6 +253,7 @@ def get_shared_state():
       "last_seen": 0.0,
       "packet_count": 0,
       "mqtt_connected": False,
+      "last_reconnect_attempt": 0.0,
   }
 
 
@@ -383,11 +384,14 @@ with st.sidebar:
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
+  now_ts = time.time()
   if not shared_state.get("mqtt_connected", False):
-    try:
-      mqtt_client.reconnect()
-    except Exception:
-      pass
+    if now_ts - shared_state.get("last_reconnect_attempt", 0.0) >= 6.0:
+      shared_state["last_reconnect_attempt"] = now_ts
+      try:
+        mqtt_client.reconnect()
+      except Exception:
+        pass
   else:
     mqtt_client.subscribe(TOPIC_TELEMETRY)
 
