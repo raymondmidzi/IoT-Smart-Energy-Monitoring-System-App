@@ -129,6 +129,15 @@ st.markdown(
         color: #b3d7ff;
         margin-top: 4px;
     }
+    .tariff-pill {
+        background: rgba(10, 38, 78, 0.85);
+        border: 1px solid #66b2ff;
+        border-radius: 10px;
+        padding: 8px 12px;
+        font-size: 13px;
+        color: #e6f2ff;
+        margin-top: 6px;
+    }
     div.stButton > button {
         background-color: #103466 !important;
         color: #ffffff !important;
@@ -168,6 +177,46 @@ DEFAULT_ADMIN_PIN = "1234"
 LIVE_APP_URL = "https://iot-smart-energy-monitoring-system-app-ll9eogusavugx8scs5x6qj.streamlit.app/"
 CAT_TZ = datetime.timezone(datetime.timedelta(hours=2))
 
+# Stepped Residential Tariff Bands (ZETDC Inclining Block Structure)
+TARIFF_BANDS = [
+    {"band": 1, "name": "Band 1 (0–50 kWh Lifeline)", "min": 0.0, "max": 50.0, "rate": 0.05},
+    {"band": 2, "name": "Band 2 (51–200 kWh Standard)", "min": 50.0, "max": 200.0, "rate": 0.11},
+    {"band": 3, "name": "Band 3 (201–300 kWh Upper)", "min": 200.0, "max": 300.0, "rate": 0.14},
+    {"band": 4, "name": "Band 4 (>300 kWh Peak)", "min": 300.0, "max": float("inf"), "rate": 0.17},
+]
+
+
+def compute_stepped_tariff(kwh_used: float):
+  """Returns (total_cost, active_band_num, active_rate, band_breakdown_list)."""
+  kwh_used = max(0.0, float(kwh_used))
+  rem = kwh_used
+  total_cost = 0.0
+  breakdown = []
+
+  for b in TARIFF_BANDS:
+    span = b["max"] - b["min"]
+    units_in_band = min(rem, span) if span != float("inf") else rem
+    band_cost = units_in_band * b["rate"]
+    total_cost += band_cost
+    breakdown.append({
+        "Tariff Block": b["name"],
+        "Rate ($/kWh)": f"${b['rate']:.2f}",
+        "Units Used (kWh)": round(units_in_band, 3),
+        "Block Cost ($)": round(band_cost, 2),
+    })
+    rem = max(0.0, rem - units_in_band)
+
+  if kwh_used < 50.0:
+    active_band, active_rate = 1, 0.05
+  elif kwh_used < 200.0:
+    active_band, active_rate = 2, 0.11
+  elif kwh_used < 300.0:
+    active_band, active_rate = 3, 0.14
+  else:
+    active_band, active_rate = 4, 0.17
+
+  return round(total_cost, 2), active_band, active_rate, breakdown
+
 
 @st.cache_resource
 def get_shared_state():
@@ -185,8 +234,10 @@ def get_shared_state():
           "kwh": 0.00,
           "units": 100.00,
           "days": 24,
-          "credit": 1000.00,
+          "credit": 8.00,
           "cost": 0.00,
+          "band": 1,
+          "rate": 0.05,
           "sec": 0,
           "ref": 0,
           "lit": 0,
@@ -197,6 +248,7 @@ def get_shared_state():
       "history": [],
       "daily_kwh": {},
       "last_kwh": None,
+      "billing_month": datetime.datetime.now(tz=CAT_TZ).strftime("%Y-%m"),
       "locks": {},
       "last_seen": 0.0,
       "packet_count": 0,
@@ -248,8 +300,15 @@ def on_message(client, userdata, msg):
         "Voltage (V)": v_val,
         "Current (A)": i_val,
     })
-    if len(hist) > 720:  # Keep rolling ~24-minute window at 2s intervals
+    if len(hist) > 720:
       del hist[:-720]
+
+    # Automatic monthly rollover check (CAT UTC+2)
+    current_ym_str = local_dt.strftime("%Y-%m")
+    if shared_state.get("billing_month") != current_ym_str:
+      shared_state["billing_month"] = current_ym_str
+      shared_state["daily_kwh"] = {}
+      shared_state["last_kwh"] = kwh_total
 
     # Track real daily accumulated kWh
     day_key = local_dt.strftime("%Y-%m-%d")
@@ -324,7 +383,6 @@ with st.sidebar:
 # ============================================================
 @st.fragment(run_every=2 if auto_refresh else None)
 def render_active_page(active_page):
-  # Ensure active subscription & self-healing broker connection
   if not shared_state.get("mqtt_connected", False):
     try:
       mqtt_client.reconnect()
@@ -336,7 +394,13 @@ def render_active_page(active_page):
   data = shared_state["telemetry"]
   manual_active = int(data.get("manual", 0)) == 1
 
-  # Check if telemetry packets arrived within the last 10 seconds
+  # Compute stepped tariff metrics consistently
+  kwh_used = float(data.get("kwh", 0.0))
+  stepped_cost, active_band, active_rate, tariff_breakdown = compute_stepped_tariff(kwh_used)
+  cost_display = float(data.get("cost", stepped_cost))
+  band_display = int(data.get("band", active_band))
+  rate_display = float(data.get("rate", active_rate))
+
   last_seen = shared_state.get("last_seen", 0.0)
   is_online = (last_seen > 0.0) and ((time.time() - last_seen) <= 10.0)
 
@@ -364,7 +428,7 @@ def render_active_page(active_page):
       <div class="hmi-header">
           <div>
               <div class="hmi-title">IoT SMART ENERGY MANAGEMENT SYSTEM</div>
-              <div class="hmi-subtitle">Real-time Monitoring | Load Management | Usage Trends</div>
+              <div class="hmi-subtitle">Real-time Monitoring | Load Management | Stepped Tariff Billing</div>
           </div>
           <div>{status_html}</div>
       </div>
@@ -432,7 +496,7 @@ def render_active_page(active_page):
 
     with col_right:
       st.markdown('<div class="dwin-panel">', unsafe_allow_html=True)
-      st.markdown("### 💵 Prepaid Credit")
+      st.markdown("### 💵 Prepaid Credit & Stepped Tariff")
 
       r1_c1, r1_c2 = st.columns(2)
       with r1_c1:
@@ -462,13 +526,15 @@ def render_active_page(active_page):
 
       r2_c1, r2_c2 = st.columns(2)
       with r2_c1:
-        credit_val = data.get("credit", data["units"] * 10.0)
+        total_purchased = float(data["units"]) + kwh_used
+        purchased_val, _, _, _ = compute_stepped_tariff(total_purchased)
+        credit_val = float(data.get("credit", max(0.0, purchased_val - cost_display)))
         st.markdown(
             f"""
             <div class="dwin-subcard">
                 <div class="card-label">🪙 Credit</div>
-                <div class="card-value-red">{credit_val:.2f}</div>
-                <div class="card-note">Remaining Balance</div>
+                <div class="card-value-red">${credit_val:.2f}</div>
+                <div class="card-note">Remaining Value (Stepped)</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -479,12 +545,23 @@ def render_active_page(active_page):
             f"""
             <div class="dwin-subcard">
                 <div class="card-label">💰 Cost</div>
-                <div class="card-value-red">{data['cost']:.2f}</div>
-                <div class="card-note">Estimate For The Month</div>
+                <div class="card-value-red">${cost_display:.2f}</div>
+                <div class="card-note">Active: Band {band_display} (${rate_display:.2f}/kWh)</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
+
+      active_cycle_label = datetime.datetime.now(tz=CAT_TZ).strftime("%b %Y")
+      st.markdown(
+          f"""
+          <div class="tariff-pill">
+              📊 <b>Stepped Tariff Tier:</b> Band {band_display} (${rate_display:.2f}/kWh) &nbsp;|&nbsp;
+              <b>{active_cycle_label} Usage:</b> {kwh_used:.3f} kWh (Auto-resets 1st of month)
+          </div>
+          """,
+          unsafe_allow_html=True,
+      )
 
       st.markdown("</div>", unsafe_allow_html=True)
 
@@ -585,7 +662,7 @@ def render_active_page(active_page):
     st.markdown("</div>", unsafe_allow_html=True)
 
   # ----------------------------------------------------------
-  # PAGE 3: CONSUMPTION (REAL LIVE TELEMETRY HISTORY)
+  # PAGE 3: CONSUMPTION & STEPPED TARIFF BREAKDOWN
   # ----------------------------------------------------------
   elif active_page == "📊 Consumption":
     st.markdown('<div class="dwin-panel">', unsafe_allow_html=True)
@@ -682,7 +759,15 @@ def render_active_page(active_page):
     )
     st.plotly_chart(fig, key=f"chart_{period}", use_container_width=True)
     st.caption(
-        f"📡 Live telemetry samples recorded: {len(hist)} | Total metered energy: {data['kwh']:.3f} kWh"
+        f"📡 Live telemetry samples recorded: {len(hist)} | Total metered energy: {kwh_used:.3f} kWh"
+    )
+
+    st.markdown("---")
+    st.markdown("#### 🧾 Stepped Residential Tariff Breakdown (ZETDC Inclining Block)")
+    st.dataframe(
+        pd.DataFrame(tariff_breakdown),
+        use_container_width=True,
+        hide_index=True,
     )
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -830,6 +915,28 @@ def render_active_page(active_page):
         ):
           mqtt_client.publish(TOPIC_TOPUP, str(topup_units))
           st.success(f"Credited {topup_units:.2f} units!")
+
+      st.markdown(
+          "<hr style='border-color: rgba(255,255,255,0.35);'>",
+          unsafe_allow_html=True,
+      )
+
+      s2b_lbl, s2b_ctrl = st.columns([2, 1])
+      with s2b_lbl:
+        st.markdown("### 📅 Monthly Billing Cycle Reset")
+        st.caption(
+            "Auto-resets on the 1st of every month (CAT UTC+2). Use this button"
+            " for an immediate manual reset back to Band 1 ($0.05/kWh) while"
+            " preserving remaining kWh units."
+        )
+      with s2b_ctrl:
+        if st.button(
+            "🔄 Reset Billing Month", key="btn_reset_month", use_container_width=True
+        ):
+          mqtt_client.publish(TOPIC_SETTINGS, "reset_month")
+          shared_state["daily_kwh"] = {}
+          shared_state["last_kwh"] = 0.0
+          st.success("Billing cycle reset to Band 1 ($0.05/kWh)!")
 
       st.markdown(
           "<hr style='border-color: rgba(255,255,255,0.35);'>",
