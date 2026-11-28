@@ -1,5 +1,9 @@
+import calendar
 import datetime
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import json
+import smtplib
 import time
 import uuid
 import paho.mqtt.client as mqtt
@@ -219,6 +223,33 @@ def compute_stepped_tariff(kwh_used: float):
   return round(total_cost, 2), active_band, active_rate, breakdown
 
 
+def _load_default_email_config():
+  """Loads optional SMTP credentials from st.secrets if configured."""
+  cfg = {
+      "enabled": False,
+      "smtp_server": "smtp.gmail.com",
+      "smtp_port": 465,
+      "sender_email": "",
+      "app_password": "",
+      "recipient_email": "",
+      "sent_for_month": "",
+      "last_status": "Not yet sent",
+  }
+  try:
+    if "email" in st.secrets:
+      sec = st.secrets["email"]
+      cfg["sender_email"] = sec.get("sender_email", "")
+      cfg["app_password"] = sec.get("app_password", "")
+      cfg["recipient_email"] = sec.get("recipient_email", "")
+      cfg["smtp_server"] = sec.get("smtp_server", "smtp.gmail.com")
+      cfg["smtp_port"] = int(sec.get("smtp_port", 465))
+      if cfg["sender_email"] and cfg["app_password"] and cfg["recipient_email"]:
+        cfg["enabled"] = True
+  except Exception:
+    pass
+  return cfg
+
+
 @st.cache_resource
 def get_shared_state():
   return {
@@ -250,6 +281,7 @@ def get_shared_state():
       "daily_kwh": {},
       "last_kwh": None,
       "billing_month": datetime.datetime.now(tz=CAT_TZ).strftime("%Y-%m"),
+      "email_cfg": _load_default_email_config(),
       "locks": {},
       "last_seen": 0.0,
       "packet_count": 0,
@@ -260,6 +292,197 @@ def get_shared_state():
 
 
 shared_state = get_shared_state()
+
+
+def send_monthly_statement_email(reason: str = "Scheduled Pre-Reset Monthly Statement"):
+  """Sends a formatted HTML + CSV energy consumption & cost report via SMTP."""
+  cfg = shared_state["email_cfg"]
+  sender = cfg.get("sender_email", "").strip()
+  password = cfg.get("app_password", "").strip()
+  recipient = cfg.get("recipient_email", "").strip()
+  smtp_server = cfg.get("smtp_server", "smtp.gmail.com").strip()
+  smtp_port = int(cfg.get("smtp_port", 465))
+
+  if not sender or not password or not recipient:
+    msg_err = "Missing Sender Email, App Password, or Recipient Email."
+    cfg["last_status"] = f"Failed: {msg_err}"
+    return False, msg_err
+
+  now_cat = datetime.datetime.now(tz=CAT_TZ)
+  month_label = now_cat.strftime("%B %Y")
+  data = shared_state["telemetry"]
+  kwh_used = float(data.get("kwh", 0.0))
+  units_rem = float(data.get("units", 0.0))
+  stepped_cost, active_band, active_rate, breakdown = compute_stepped_tariff(kwh_used)
+  cost_val = float(data.get("cost", stepped_cost))
+  credit_val = float(data.get("credit", 0.0))
+
+  # Build itemized HTML tariff rows
+  band_rows_html = ""
+  for row in breakdown:
+    band_rows_html += (
+        f"<tr>"
+        f"<td style='padding:8px; border:1px solid #cbd5e1;'>{row['Tariff Block']}</td>"
+        f"<td style='padding:8px; border:1px solid #cbd5e1;'>{row['Rate ($/kWh)']}</td>"
+        f"<td style='padding:8px; border:1px solid #cbd5e1;'>{row['Units Used (kWh)']:.3f} kWh</td>"
+        f"<td style='padding:8px; border:1px solid #cbd5e1;'><b>${row['Block Cost ($)']:.2f}</b></td>"
+        f"</tr>"
+    )
+
+  # Build daily trend rows from recorded daily_kwh
+  daily_map = shared_state.get("daily_kwh", {})
+  daily_rows_html = ""
+  csv_lines = ["Date,Consumed_kWh"]
+  if daily_map:
+    for d_str in sorted(daily_map.keys()):
+      d_kwh = float(daily_map[d_str])
+      daily_rows_html += (
+          f"<tr>"
+          f"<td style='padding:6px 8px; border:1px solid #cbd5e1;'>{d_str}</td>"
+          f"<td style='padding:6px 8px; border:1px solid #cbd5e1;'>{d_kwh:.3f} kWh</td>"
+          f"</tr>"
+      )
+      csv_lines.append(f"{d_str},{d_kwh:.4f}")
+  else:
+    today_str = now_cat.strftime("%Y-%m-%d")
+    daily_rows_html = (
+        f"<tr>"
+        f"<td style='padding:6px 8px; border:1px solid #cbd5e1;'>{today_str} (Cycle Total)</td>"
+        f"<td style='padding:6px 8px; border:1px solid #cbd5e1;'>{kwh_used:.3f} kWh</td>"
+        f"</tr>"
+    )
+    csv_lines.append(f"{today_str},{kwh_used:.4f}")
+
+  html_body = f"""
+  <html>
+  <body style="font-family: Arial, sans-serif; color: #1e293b; background-color: #f8fafc; padding: 20px;">
+    <div style="max-width: 680px; margin: auto; background: #ffffff; border-radius: 12px; border: 1px solid #cbd5e1; overflow: hidden;">
+      <div style="background: #1b5299; color: #ffffff; padding: 20px 24px;">
+        <h2 style="margin: 0; font-size: 20px;">⚡ IoT Smart Energy Management System</h2>
+        <p style="margin: 6px 0 0 0; font-size: 13px; color: #dbeafe;">
+          Monthly Consumption &amp; Stepped Tariff Statement — {month_label}
+        </p>
+      </div>
+      <div style="padding: 24px;">
+        <p style="font-size: 13px; color: #475569; margin-top: 0;">
+          <b>Trigger:</b> {reason}<br/>
+          <b>Generated:</b> {now_cat.strftime('%d %b %Y, %H:%M:%S CAT (UTC+2)')}
+        </p>
+
+        <table style="width: 100%; border-collapse: collapse; margin: 16px 0;">
+          <tr>
+            <td style="padding: 12px; background: #eff6ff; border: 1px solid #bfdbfe; width: 50%;">
+              <div style="font-size: 12px; color: #1e40af;">TOTAL MONTHLY CONSUMPTION</div>
+              <div style="font-size: 22px; font-weight: bold; color: #0f172a;">{kwh_used:.3f} kWh</div>
+            </td>
+            <td style="padding: 12px; background: #fef2f2; border: 1px solid #fecaca; width: 50%;">
+              <div style="font-size: 12px; color: #991b1b;">TOTAL STEPPED TARIFF COST</div>
+              <div style="font-size: 22px; font-weight: bold; color: #dc2626;">${cost_val:.2f}</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding: 12px; background: #f8fafc; border: 1px solid #cbd5e1;">
+              <div style="font-size: 12px; color: #475569;">REMAINING PREPAID UNITS</div>
+              <div style="font-size: 18px; font-weight: bold; color: #0f172a;">{units_rem:.2f} kWh</div>
+            </td>
+            <td style="padding: 12px; background: #f8fafc; border: 1px solid #cbd5e1;">
+              <div style="font-size: 12px; color: #475569;">REMAINING CREDIT / ACTIVE BAND</div>
+              <div style="font-size: 18px; font-weight: bold; color: #0f172a;">${credit_val:.2f} (Band {active_band} @ ${active_rate:.2f}/kWh)</div>
+            </td>
+          </tr>
+        </table>
+
+        <h3 style="color: #1b5299; font-size: 15px; margin-top: 20px;">🧾 ZETDC Stepped Tariff Breakdown</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+          <thead>
+            <tr style="background: #1b5299; color: #ffffff;">
+              <th style="padding: 8px; text-align: left; border: 1px solid #1b5299;">Tariff Block</th>
+              <th style="padding: 8px; text-align: left; border: 1px solid #1b5299;">Rate</th>
+              <th style="padding: 8px; text-align: left; border: 1px solid #1b5299;">Units Used</th>
+              <th style="padding: 8px; text-align: left; border: 1px solid #1b5299;">Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {band_rows_html}
+          </tbody>
+        </table>
+
+        <h3 style="color: #1b5299; font-size: 15px; margin-top: 20px;">📈 Daily Consumption Trend Log</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+          <thead>
+            <tr style="background: #334155; color: #ffffff;">
+              <th style="padding: 6px 8px; text-align: left; border: 1px solid #334155;">Date (CAT)</th>
+              <th style="padding: 6px 8px; text-align: left; border: 1px solid #334155;">Energy Consumed (kWh)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {daily_rows_html}
+          </tbody>
+        </table>
+
+        <p style="font-size: 12px; color: #64748b; margin-top: 20px;">
+          Note: Your monthly consumption counter automatically resets to 0.000 kWh (Band 1 @ $0.05/kWh) at 00:00 CAT on the 1st of the new month while preserving your remaining prepaid kWh balance ({units_rem:.2f} kWh).
+        </p>
+      </div>
+    </div>
+  </body>
+  </html>
+  """
+
+  try:
+    msg = MIMEMultipart("mixed")
+    msg["Subject"] = f"SEMS Monthly Energy Statement ({month_label}) - {kwh_used:.2f} kWh / ${cost_val:.2f}"
+    msg["From"] = sender
+    msg["To"] = recipient
+
+    msg.attach(MIMEText(html_body, "html"))
+
+    # Attach CSV summary file
+    csv_attachment = MIMEText("\n".join(csv_lines), "csv")
+    csv_attachment.add_header(
+        "Content-Disposition",
+        "attachment",
+        filename=f"SEMS_Consumption_{now_cat.strftime('%Y_%m')}.csv",
+    )
+    msg.attach(csv_attachment)
+
+    if smtp_port == 465:
+      with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15) as server:
+        server.login(sender, password)
+        server.sendmail(sender, [recipient], msg.as_string())
+    else:
+      with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as server:
+        server.starttls()
+        server.login(sender, password)
+        server.sendmail(sender, [recipient], msg.as_string())
+
+    ts_str = now_cat.strftime("%d %b %Y, %H:%M:%S CAT")
+    cfg["last_status"] = f"Sent ({ts_str})"
+    return True, f"Monthly statement emailed to {recipient}!"
+  except Exception as exc:
+    cfg["last_status"] = f"Error: {exc}"
+    return False, str(exc)
+
+
+def check_pre_reset_email_schedule():
+  """Automatically sends the monthly email report on the last day of the month from 23:00 CAT before midnight reset."""
+  cfg = shared_state["email_cfg"]
+  if not cfg.get("enabled", False):
+    return
+
+  now_cat = datetime.datetime.now(tz=CAT_TZ)
+  ym_key = now_cat.strftime("%Y-%m")
+  if cfg.get("sent_for_month") == ym_key:
+    return
+
+  last_day_of_month = calendar.monthrange(now_cat.year, now_cat.month)[1]
+  # Trigger in the final hour of the month (23:00 - 23:59 CAT on the last day)
+  if now_cat.day == last_day_of_month and now_cat.hour >= 23:
+    ok, _ = send_monthly_statement_email(
+        reason="Automatic End-of-Month Report (1 Hour Before Midnight Reset)"
+    )
+    if ok:
+      cfg["sent_for_month"] = ym_key
 
 
 def lock_keys(keys, duration=2.5):
@@ -314,6 +537,16 @@ def on_message(client, userdata, msg):
     # Automatic monthly rollover check (CAT UTC+2)
     current_ym_str = local_dt.strftime("%Y-%m")
     if shared_state.get("billing_month") != current_ym_str:
+      # If end-of-month email wasn't sent yet (e.g. app was asleep at 23:00), send final snapshot before clearing
+      cfg = shared_state["email_cfg"]
+      prev_ym = shared_state.get("billing_month", "")
+      if cfg.get("enabled") and prev_ym and cfg.get("sent_for_month") != prev_ym:
+        ok, _ = send_monthly_statement_email(
+            reason=f"Automatic Month-End Rollover Statement ({prev_ym})"
+        )
+        if ok:
+          cfg["sent_for_month"] = prev_ym
+
       shared_state["billing_month"] = current_ym_str
       shared_state["daily_kwh"] = {}
       shared_state["last_kwh"] = kwh_total
@@ -417,6 +650,9 @@ def render_active_page(active_page):
         pass
   else:
     mqtt_client.subscribe(TOPIC_TELEMETRY)
+
+  # Check automated pre-reset end-of-month email trigger (23:00 CAT on last day of month)
+  check_pre_reset_email_schedule()
 
   data = shared_state["telemetry"]
   manual_active = int(data.get("manual", 0)) == 1
@@ -581,11 +817,17 @@ def render_active_page(active_page):
         )
 
       active_cycle_label = datetime.datetime.now(tz=CAT_TZ).strftime("%b %Y")
+      email_cfg = shared_state["email_cfg"]
+      email_badge = (
+          f"📧 Auto-Email: ON ({email_cfg['recipient_email']})"
+          if email_cfg.get("enabled")
+          else "📧 Auto-Email: Configure in Settings"
+      )
       st.markdown(
           f"""
           <div class="tariff-pill">
               📊 <b>Stepped Tariff Tier:</b> Band {band_display} (${rate_display:.2f}/kWh) &nbsp;|&nbsp;
-              <b>{active_cycle_label} Usage:</b> {kwh_used:.3f} kWh (Auto-resets 1st of month)
+              <b>{active_cycle_label} Usage:</b> {kwh_used:.3f} kWh &nbsp;|&nbsp; {email_badge}
           </div>
           """,
           unsafe_allow_html=True,
@@ -866,8 +1108,8 @@ def render_active_page(active_page):
     if not st.session_state["settings_unlocked"]:
       st.markdown("### 🔐 Admin Authentication Required")
       st.caption(
-          "Enter the meter PIN to access Manual Control override and Prepaid"
-          " Token Top-up."
+          "Enter the meter PIN to access Manual Control override, Prepaid Token"
+          " Top-up, and Automated Monthly Email Reporting."
       )
       pin_col, btn_col = st.columns([2, 1])
       with pin_col:
@@ -949,18 +1191,91 @@ def render_active_page(active_page):
           unsafe_allow_html=True,
       )
 
+      # --- AUTOMATED PRE-RESET MONTHLY EMAIL REPORTING ---
+      email_cfg = shared_state["email_cfg"]
+      em_lbl, em_ctrl = st.columns([1.4, 1.6])
+      with em_lbl:
+        st.markdown("### 📧 Monthly Email Statement (Before Auto-Reset)")
+        st.caption(
+            "Automatically emails your full consumption trends, ZETDC stepped"
+            " tariff cost breakdown, and CSV log at 23:00 CAT on the last day of"
+            " every month (1 hour before the midnight auto-reset), as well as"
+            " before any manual month reset."
+        )
+        st.caption(f"📬 Delivery Status: **{email_cfg.get('last_status', 'Not yet sent')}**")
+
+      with em_ctrl:
+        auto_email_on = st.toggle(
+            "Enable Automated Month-End Email",
+            value=bool(email_cfg.get("enabled", False)),
+            key="toggle_auto_email",
+        )
+        recipient_in = st.text_input(
+            "Recipient Email",
+            value=email_cfg.get("recipient_email", ""),
+            placeholder="Recipient Email (e.g., raymond@gmail.com)",
+            key="email_recipient_in",
+            label_visibility="collapsed",
+        )
+        sender_in = st.text_input(
+            "Sender Gmail",
+            value=email_cfg.get("sender_email", ""),
+            placeholder="Sender Gmail Address (SMTP)",
+            key="email_sender_in",
+            label_visibility="collapsed",
+        )
+        app_pass_in = st.text_input(
+            "Gmail App Password",
+            value=email_cfg.get("app_password", ""),
+            type="password",
+            placeholder="16-Character Gmail App Password",
+            key="email_app_pass_in",
+            label_visibility="collapsed",
+        )
+
+        b_save_em, b_send_now = st.columns(2)
+        with b_save_em:
+          if st.button("💾 Save Email Settings", key="btn_save_email", use_container_width=True):
+            email_cfg["enabled"] = auto_email_on
+            email_cfg["recipient_email"] = recipient_in.strip()
+            email_cfg["sender_email"] = sender_in.strip()
+            email_cfg["app_password"] = app_pass_in.strip()
+            st.success("✅ Email notification settings saved!")
+        with b_send_now:
+          if st.button("📤 Send Report Now", key="btn_send_email_now", use_container_width=True):
+            email_cfg["enabled"] = auto_email_on
+            email_cfg["recipient_email"] = recipient_in.strip()
+            email_cfg["sender_email"] = sender_in.strip()
+            email_cfg["app_password"] = app_pass_in.strip()
+            ok, feedback = send_monthly_statement_email(
+                reason="Manual On-Demand Statement Request"
+            )
+            if ok:
+              st.success(f"✅ {feedback}")
+            else:
+              st.error(f"❌ {feedback}")
+
+      st.markdown(
+          "<hr style='border-color: rgba(255,255,255,0.35);'>",
+          unsafe_allow_html=True,
+      )
+
       s2b_lbl, s2b_ctrl = st.columns([2, 1])
       with s2b_lbl:
         st.markdown("### 📅 Monthly Billing Cycle Reset")
         st.caption(
-            "Auto-resets on the 1st of every month (CAT UTC+2). Use this button"
-            " for an immediate manual reset back to Band 1 ($0.05/kWh) while"
-            " preserving remaining kWh units."
+            "Auto-resets on the 1st of every month (CAT UTC+2). Clicking Reset"
+            " emails your final monthly statement first (if enabled), then resets"
+            " back to Band 1 ($0.05/kWh) while preserving remaining kWh units."
         )
       with s2b_ctrl:
         if st.button(
             "🔄 Reset Billing Month", key="btn_reset_month", use_container_width=True
         ):
+          if email_cfg.get("enabled"):
+            send_monthly_statement_email(
+                reason="Pre-Reset Statement (Manual Billing Cycle Reset)"
+            )
           mqtt_client.publish(TOPIC_SETTINGS, "reset_month")
           shared_state["daily_kwh"] = {}
           shared_state["last_kwh"] = 0.0
