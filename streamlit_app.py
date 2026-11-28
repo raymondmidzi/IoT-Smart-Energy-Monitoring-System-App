@@ -1009,9 +1009,22 @@ def render_active_page(active_page):
       fig.update_yaxes(rangemode="tozero")
 
     fig.update_layout(
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(15, 52, 105, 0.6)",
-        font_color="#FFFFFF",
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font_color="#0f172a",
+        title_font_color="#0f172a",
+        xaxis=dict(
+            gridcolor="#e2e8f0",
+            linecolor="#cbd5e1",
+            tickfont=dict(color="#1e293b"),
+            title_font=dict(color="#0f172a"),
+        ),
+        yaxis=dict(
+            gridcolor="#e2e8f0",
+            linecolor="#cbd5e1",
+            tickfont=dict(color="#1e293b"),
+            title_font=dict(color="#0f172a"),
+        ),
     )
     st.plotly_chart(fig, key=f"chart_{period}", use_container_width=True)
     st.caption(
