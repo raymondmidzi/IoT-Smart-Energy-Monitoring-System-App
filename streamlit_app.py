@@ -537,16 +537,9 @@ def on_message(client, userdata, msg):
     # Automatic monthly rollover check (CAT UTC+2)
     current_ym_str = local_dt.strftime("%Y-%m")
     if shared_state.get("billing_month") != current_ym_str:
-      # If end-of-month email wasn't sent yet (e.g. app was asleep at 23:00), send final snapshot before clearing
-      cfg = shared_state["email_cfg"]
       prev_ym = shared_state.get("billing_month", "")
-      if cfg.get("enabled") and prev_ym and cfg.get("sent_for_month") != prev_ym:
-        ok, _ = send_monthly_statement_email(
-            reason=f"Automatic Month-End Rollover Statement ({prev_ym})"
-        )
-        if ok:
-          cfg["sent_for_month"] = prev_ym
-
+      if prev_ym:
+        shared_state["pending_rollover_email_ym"] = prev_ym
       shared_state["billing_month"] = current_ym_str
       shared_state["daily_kwh"] = {}
       shared_state["last_kwh"] = kwh_total
@@ -654,6 +647,17 @@ def render_active_page(active_page):
   # Check automated pre-reset end-of-month email trigger (23:00 CAT on last day of month)
   check_pre_reset_email_schedule()
 
+  # Handle any queued month-end rollover email on the main thread (never block MQTT thread)
+  pending_ym = shared_state.pop("pending_rollover_email_ym", None)
+  if pending_ym:
+    cfg = shared_state["email_cfg"]
+    if cfg.get("enabled") and cfg.get("sent_for_month") != pending_ym:
+      ok, _ = send_monthly_statement_email(
+          reason=f"Automatic Month-End Rollover Statement ({pending_ym})"
+      )
+      if ok:
+        cfg["sent_for_month"] = pending_ym
+
   data = shared_state["telemetry"]
   manual_active = int(data.get("manual", 0)) == 1
 
@@ -665,11 +669,17 @@ def render_active_page(active_page):
   rate_display = float(data.get("rate", active_rate))
 
   last_seen = shared_state.get("last_seen", 0.0)
-  is_online = (last_seen > 0.0) and ((time.time() - last_seen) <= 10.0)
+  pkt_count = shared_state.get("packet_count", 0)
+  is_online = (last_seen > 0.0) and ((time.time() - last_seen) <= 12.0)
   broker_note = shared_state.get("mqtt_status_msg", "")
 
   if is_online:
-    status_html = '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
+    status_html = (
+        '<div style="text-align: right;">'
+        '<span class="status-badge-online">🟢 ESP32 ONLINE</span>'
+        f'<div class="last-seen-text" style="color:#bbf7d0;">{broker_note} • Packets Rx: {pkt_count}</div>'
+        '</div>'
+    )
   elif last_seen > 0.0:
     last_seen_dt = datetime.datetime.fromtimestamp(last_seen, tz=CAT_TZ)
     last_seen_str = last_seen_dt.strftime("%d %b %Y, %H:%M:%S CAT")
@@ -683,7 +693,7 @@ def render_active_page(active_page):
     status_html = (
         '<div style="text-align: right;">'
         '<span class="status-badge-offline">🔴 ESP32 OFFLINE</span>'
-        f'<div class="last-seen-text">Last seen: Never ({broker_note})</div>'
+        f'<div class="last-seen-text">Last seen: Never ({broker_note} • Packets Rx: {pkt_count})</div>'
         '</div>'
     )
 
