@@ -286,7 +286,7 @@ def get_shared_state():
       "last_seen": 0.0,
       "packet_count": 0,
       "mqtt_connected": False,
-      "mqtt_status_msg": "Connecting to HiveMQ...",
+      "mqtt_status_msg": "Connecting to HiveMQ WS...",
       "last_reconnect_attempt": 0.0,
   }
 
@@ -317,7 +317,6 @@ def send_monthly_statement_email(reason: str = "Scheduled Pre-Reset Monthly Stat
   cost_val = float(data.get("cost", stepped_cost))
   credit_val = float(data.get("credit", 0.0))
 
-  # Build itemized HTML tariff rows
   band_rows_html = ""
   for row in breakdown:
     band_rows_html += (
@@ -329,7 +328,6 @@ def send_monthly_statement_email(reason: str = "Scheduled Pre-Reset Monthly Stat
         f"</tr>"
     )
 
-  # Build daily trend rows from recorded daily_kwh
   daily_map = shared_state.get("daily_kwh", {})
   daily_rows_html = ""
   csv_lines = ["Date,Consumed_kWh"]
@@ -437,7 +435,6 @@ def send_monthly_statement_email(reason: str = "Scheduled Pre-Reset Monthly Stat
 
     msg.attach(MIMEText(html_body, "html"))
 
-    # Attach CSV summary file
     csv_attachment = MIMEText("\n".join(csv_lines), "csv")
     csv_attachment.add_header(
         "Content-Disposition",
@@ -476,7 +473,6 @@ def check_pre_reset_email_schedule():
     return
 
   last_day_of_month = calendar.monthrange(now_cat.year, now_cat.month)[1]
-  # Trigger in the final hour of the month (23:00 - 23:59 CAT on the last day)
   if now_cat.day == last_day_of_month and now_cat.hour >= 23:
     ok, _ = send_monthly_statement_email(
         reason="Automatic End-of-Month Report (1 Hour Before Midnight Reset)"
@@ -494,7 +490,7 @@ def lock_keys(keys, duration=2.5):
 def on_connect(client, userdata, flags, rc, properties=None):
   if rc == 0:
     shared_state["mqtt_connected"] = True
-    shared_state["mqtt_status_msg"] = "Broker Connected"
+    shared_state["mqtt_status_msg"] = "Broker Connected (WS)"
     client.subscribe(TOPIC_TELEMETRY)
   else:
     shared_state["mqtt_connected"] = False
@@ -517,7 +513,6 @@ def on_message(client, userdata, msg):
         continue
       shared_state["telemetry"][k] = v
 
-    # Record live timestamped sample (Harare CAT UTC+2) for real load curve
     local_dt = datetime.datetime.fromtimestamp(now, tz=CAT_TZ)
     kw_val = round(float(shared_state["telemetry"].get("power", 0.0)) / 1000.0, 3)
     v_val = round(float(shared_state["telemetry"].get("voltage", 0.0)), 2)
@@ -534,7 +529,6 @@ def on_message(client, userdata, msg):
     if len(hist) > 720:
       del hist[:-720]
 
-    # Automatic monthly rollover check (CAT UTC+2)
     current_ym_str = local_dt.strftime("%Y-%m")
     if shared_state.get("billing_month") != current_ym_str:
       prev_ym = shared_state.get("billing_month", "")
@@ -544,7 +538,6 @@ def on_message(client, userdata, msg):
       shared_state["daily_kwh"] = {}
       shared_state["last_kwh"] = kwh_total
 
-    # Track real daily accumulated kWh
     day_key = local_dt.strftime("%Y-%m-%d")
     prev_kwh = shared_state["last_kwh"]
     if prev_kwh is not None and kwh_total >= prev_kwh:
@@ -559,43 +552,29 @@ def on_message(client, userdata, msg):
     pass
 
 
-def _build_mqtt_client(transport="tcp", port=1883):
-  unique_id = f"SEMS-Web-{uuid.uuid4().hex[:8]}"
+def _build_ws_mqtt_client():
+  unique_id = f"SEMS-WebWS-{uuid.uuid4().hex[:8]}"
   if hasattr(mqtt, "CallbackAPIVersion"):
     c = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION1,
         client_id=unique_id,
-        transport=transport,
+        transport="websockets",
     )
   else:
-    c = mqtt.Client(client_id=unique_id, transport=transport)
-  if transport == "websockets":
-    c.ws_set_options(path="/mqtt")
+    c = mqtt.Client(client_id=unique_id, transport="websockets")
+  c.ws_set_options(path="/mqtt")
   c.on_connect = on_connect
   c.on_disconnect = on_disconnect
   c.on_message = on_message
   c.reconnect_delay_set(min_delay=1, max_delay=5)
-  c.connect(MQTT_BROKER, port, 60)
+  c.connect_async(MQTT_BROKER, MQTT_WS_PORT, 60)
   c.loop_start()
   return c
 
 
 @st.cache_resource
 def init_mqtt():
-  try:
-    return _build_mqtt_client("tcp", MQTT_PORT)
-  except Exception:
-    try:
-      return _build_mqtt_client("websockets", MQTT_WS_PORT)
-    except Exception as e:
-      shared_state["mqtt_status_msg"] = f"Broker error: {e}"
-      c = mqtt.Client(client_id=f"SEMS-Web-{uuid.uuid4().hex[:8]}")
-      c.on_connect = on_connect
-      c.on_disconnect = on_disconnect
-      c.on_message = on_message
-      c.connect_async(MQTT_BROKER, MQTT_PORT, 60)
-      c.loop_start()
-      return c
+  return _build_ws_mqtt_client()
 
 
 mqtt_client = init_mqtt()
@@ -635,7 +614,7 @@ with st.sidebar:
 def render_active_page(active_page):
   now_ts = time.time()
   if not shared_state.get("mqtt_connected", False):
-    if now_ts - shared_state.get("last_reconnect_attempt", 0.0) >= 6.0:
+    if now_ts - shared_state.get("last_reconnect_attempt", 0.0) >= 8.0:
       shared_state["last_reconnect_attempt"] = now_ts
       try:
         mqtt_client.reconnect()
@@ -644,10 +623,8 @@ def render_active_page(active_page):
   else:
     mqtt_client.subscribe(TOPIC_TELEMETRY)
 
-  # Check automated pre-reset end-of-month email trigger (23:00 CAT on last day of month)
   check_pre_reset_email_schedule()
 
-  # Handle any queued month-end rollover email on the main thread (never block MQTT thread)
   pending_ym = shared_state.pop("pending_rollover_email_ym", None)
   if pending_ym:
     cfg = shared_state["email_cfg"]
@@ -661,7 +638,6 @@ def render_active_page(active_page):
   data = shared_state["telemetry"]
   manual_active = int(data.get("manual", 0)) == 1
 
-  # Compute stepped tariff metrics consistently
   kwh_used = float(data.get("kwh", 0.0))
   stepped_cost, active_band, active_rate, tariff_breakdown = compute_stepped_tariff(kwh_used)
   cost_display = float(data.get("cost", stepped_cost))
