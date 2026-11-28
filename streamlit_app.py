@@ -443,19 +443,36 @@ def send_monthly_statement_email(reason: str = "Scheduled Pre-Reset Monthly Stat
     )
     msg.attach(csv_attachment)
 
-    if smtp_port == 465:
-      with smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=15) as server:
-        server.login(sender, password)
-        server.sendmail(sender, [recipient], msg.as_string())
-    else:
-      with smtplib.SMTP(smtp_server, smtp_port, timeout=15) as server:
-        server.starttls()
-        server.login(sender, password)
-        server.sendmail(sender, [recipient], msg.as_string())
+    # Try STARTTLS (587) first (best compatibility on Streamlit Cloud), then SSL (465)
+    last_exc = None
+    for port_try in ([587, 465] if smtp_port in (465, 587) else [smtp_port]):
+      try:
+        if port_try == 587:
+          with smtplib.SMTP(smtp_server, 587, timeout=15) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(sender, password.replace(" ", ""))
+            server.sendmail(sender, [recipient], msg.as_string())
+        else:
+          with smtplib.SMTP_SSL(smtp_server, port_try, timeout=15) as server:
+            server.login(sender, password.replace(" ", ""))
+            server.sendmail(sender, [recipient], msg.as_string())
+        last_exc = None
+        break
+      except Exception as attempt_err:
+        last_exc = attempt_err
+
+    if last_exc is not None:
+      raise last_exc
 
     ts_str = now_cat.strftime("%d %b %Y, %H:%M:%S CAT")
     cfg["last_status"] = f"Sent ({ts_str})"
     return True, f"Monthly statement emailed to {recipient}!"
+  except smtplib.SMTPAuthenticationError:
+    err_hint = "Gmail rejected login — use a 16-letter Google App Password (myaccount.google.com/apppasswords), not your normal Gmail password."
+    cfg["last_status"] = f"Error: {err_hint}"
+    return False, err_hint
   except Exception as exc:
     cfg["last_status"] = f"Error: {exc}"
     return False, str(exc)
